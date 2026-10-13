@@ -1,0 +1,15 @@
+[Unit]
+Description=music-convert library synchronizer
+After=default.target
+
+[Service]
+Type=simple
+# Adjust the paths to match your library and installation.
+ExecStart=%h/.local/bin/music-convert --watch -q %h/Music %h/Music-opus
+Restart=on-failure
+RestartSec=10
+# Ensure the service does not inherit a broken environment.
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
