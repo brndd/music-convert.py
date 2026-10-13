@@ -7,7 +7,9 @@ import fcntl
 import logging
 import os
 import shutil
+import signal
 import sys
+import threading
 from pathlib import Path
 
 from . import __version__
@@ -17,8 +19,10 @@ from .config import (
     SUPPORTED_EXTS,
     Config,
 )
+from .progress import LiveAwareStream, ProgressReporter
 from .reconcile import Reconciler
 from .state import State
+from .subproc import Cancelled, terminate_all
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
@@ -40,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="number of concurrent jobs (default: CPU count)",
     )
-    parser.add_argument("-q", "--quiet", action="store_true", help="only log warnings and errors")
+    parser.add_argument("-q", "--quiet", action="store_true", help="only log warnings and errors; disables progress")
     parser.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     parser.add_argument(
         "--watch",
@@ -63,6 +67,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_RESCAN_SECONDS,
         help="periodic full rescan interval in seconds (watch mode)",
+    )
+    parser.add_argument(
+        "--progress",
+        choices=("bar", "lines", "none"),
+        default="bar",
+        help="progress display: bar (default), lines (one line per item), or none",
     )
     parser.add_argument("--state-dir", type=Path, default=None, help="directory for persistent state")
     parser.add_argument("--cache-dir", type=Path, default=None, help="directory for artwork cache")
@@ -138,6 +148,33 @@ class _ProcessLock:
             self._file.close()
 
 
+def _install_signal_handlers(stop: threading.Event, logger: logging.Logger) -> dict:
+    """Turn SIGINT/SIGTERM into a clean, prompt Cancelled.
+
+    The handler kills any in-flight child processes and raises, so a blocking
+    wait is interrupted immediately instead of after the current build.
+    """
+    previous: dict = {}
+
+    def handler(signum, _frame):
+        if stop.is_set():
+            os._exit(130)
+        logger.info("received signal %s; cancelling", signum)
+        stop.set()
+        terminate_all()
+        raise Cancelled(signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous[sig] = signal.getsignal(sig)
+        signal.signal(sig, handler)
+    return previous
+
+
+def _restore_signal_handlers(previous: dict) -> None:
+    for sig, handler in previous.items():
+        signal.signal(sig, handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -145,10 +182,22 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.WARNING if args.quiet else logging.INFO,
         format=LOG_FORMAT,
-        stream=sys.stderr,
+        stream=LiveAwareStream(),
     )
     logger = logging.getLogger("music-convert")
 
+    stop = threading.Event()
+    previous = _install_signal_handlers(stop, logger)
+    try:
+        return _run(args, parser, logger, stop)
+    except Cancelled as exc:
+        logger.warning("cancelled")
+        return 128 + exc.signum if exc.signum else 130
+    finally:
+        _restore_signal_handlers(previous)
+
+
+def _run(args, parser, logger: logging.Logger, stop: threading.Event) -> int:
     source, output = _validate_paths(args.source, args.output)
 
     jobs = args.jobs if args.jobs else (os.cpu_count() or 1)
@@ -164,6 +213,7 @@ def main(argv: list[str] | None = None) -> int:
         watch=args.watch,
         settle_seconds=args.settle_seconds,
         rescan_seconds=args.rescan_interval,
+        progress="none" if args.quiet else args.progress,
         state_dir=args.state_dir,
         cache_dir=args.cache_dir,
     )
@@ -176,14 +226,15 @@ def main(argv: list[str] | None = None) -> int:
     cfg.resolved_state_dir.mkdir(parents=True, exist_ok=True)
     lock = _ProcessLock(cfg.lock_path)
     state = State(cfg.state_path)
+    reporter = ProgressReporter(cfg.progress)
     try:
         if args.watch:
             from .watcher import Watcher
 
-            Watcher(cfg, state, logger).run()
+            Watcher(cfg, state, logger, reporter, stop).run()
             return 0
 
-        summary = Reconciler(cfg, state, logger).reconcile()
+        summary = Reconciler(cfg, state, logger, reporter, stop).reconcile()
         ok = not summary.failed and not summary.collisions and not summary.incomplete
         return 0 if ok else 1
     finally:

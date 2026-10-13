@@ -37,6 +37,7 @@ triggers a rebuild of the corresponding output.
 - **Python 3.11+**
 - **mutagen** (metadata and artwork for all supported formats)
 - **inotify-simple** (watch mode)
+- **rich** (progress display)
 - **opusenc** (Fedora package: `opus-tools`)
 - **ImageMagick** (`magick`; Fedora package: `ImageMagick`)
 
@@ -64,10 +65,11 @@ For all options, see `./music-convert -h`:
 
 ```
   -j, --jobs JOBS           number of concurrent jobs (default: CPU count)
-  -q, --quiet               only log warnings and errors
+  -q, --quiet               only log warnings and errors; disables progress
   -y, --yes                 skip the confirmation prompt
       --watch               run continuously and keep the output in sync using inotify
       --dry-run             show planned changes without modifying anything
+      --progress MODE       progress display: bar (default), lines, or none
       --settle-seconds N    how long to wait for changes to settle (watch mode)
       --rescan-interval N   periodic full rescan interval in seconds (watch mode)
       --state-dir DIR       directory for persistent state
@@ -77,14 +79,32 @@ For all options, see `./music-convert -h`:
 The state and artwork cache default to the XDG state and cache directories and are keyed by
 the output path.
 
+## Progress
+
+Long runs show progress on stderr. There are two phases: a **scanning** bar while the source
+tree is walked, then a **working** bar while tracks are converted, copied, and removed. The
+default is a Rich progress bar with a count, percentage, elapsed time, and ETA; when stderr is
+not a terminal (a pipe, a log file, or the systemd service) the bar falls back to one line per
+processed track. Use `--progress lines` to request those per-item lines even on a terminal,
+`--progress none` to disable the display while keeping the summary, or `-q` to suppress
+progress and normal logging entirely.
+
+`Ctrl-C` (or `SIGTERM`) cancels promptly: in-flight `opusenc`/`magick` children are terminated,
+queued work is dropped, and partially written temporary files are cleaned up before the process
+exits. Press it a second time to force an immediate exit.
+
 ## Watch mode
 
 Watch mode uses Linux inotify, but inotify only signals *that* something may have changed.
 The real work is done by a reconciliation pass that scans the source tree, compares it against
-the recorded state, and rebuilds what changed. That reconciliation is run after a short
-debounce, on a timer, and whenever inotify reports that its event queue overflowed. This means
-the output converges even if events are missed, the daemon restarts, or files are written
-slowly.
+the recorded state, and rebuilds what changed.
+
+inotify also tells us *where* the change happened, so a reconciliation triggered by an event
+only re-examines the affected directories instead of the whole library. A full scan is still
+run at startup, on the `--rescan-interval` timer, and whenever inotify reports that its event
+queue overflowed or a watch was lost. This keeps the incremental path honest: missed events,
+a daemon restart, or files written slowly all still converge, and a quiet library does no
+per-event full-tree work.
 
 A few notes:
 

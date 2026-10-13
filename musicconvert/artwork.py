@@ -10,6 +10,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import subproc
 from .config import ART_SUFFIXES, ARTWORK_EXTENT, ARTWORK_MAX_DIM
 
 _MIME_EXT = {
@@ -80,7 +81,7 @@ def _cache_key(data: bytes, policy: str) -> str:
     return digest.hexdigest()
 
 
-def _run_magick(src: Path, dst: Path) -> None:
+def _run_magick(src: Path, dst: Path, stop=None) -> None:
     cmd = [
         "magick",
         str(src),
@@ -91,15 +92,17 @@ def _run_magick(src: Path, dst: Path) -> None:
         str(dst),
     ]
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
+        subproc.run(cmd, stop=stop)
     except FileNotFoundError as exc:  # pragma: no cover - dependency guard
         raise RuntimeError("ImageMagick (magick) is not installed") from exc
     except subprocess.CalledProcessError as exc:
-        detail = exc.stderr.decode(errors="replace").strip()
+        detail = (exc.stderr or b"").decode(errors="replace").strip()
         raise RuntimeError(f"magick failed on {src}: {detail}") from exc
 
 
-def resize_bytes(data: bytes, mime: str, cache_dir: Path, policy: str) -> Path:
+def resize_bytes(
+    data: bytes, mime: str, cache_dir: Path, policy: str, stop=None
+) -> Path:
     """Resize image *data* and return a cached JPEG path.
 
     The result is deterministic for a given image and policy, so repeated
@@ -115,7 +118,7 @@ def resize_bytes(data: bytes, mime: str, cache_dir: Path, policy: str) -> Path:
     src.write_bytes(data)
     tmp = cache_dir / f".{key}.{secrets.token_hex(4)}.jpg"
     try:
-        _run_magick(src, tmp)
+        _run_magick(src, tmp, stop=stop)
         os.replace(tmp, dest)
     finally:
         try:
@@ -129,8 +132,8 @@ def resize_bytes(data: bytes, mime: str, cache_dir: Path, policy: str) -> Path:
     return dest
 
 
-def resize_file(path: Path, cache_dir: Path, policy: str) -> Path:
-    return resize_bytes(path.read_bytes(), _mime_for_path(path), cache_dir, policy)
+def resize_file(path: Path, cache_dir: Path, policy: str, stop=None) -> Path:
+    return resize_bytes(path.read_bytes(), _mime_for_path(path), cache_dir, policy, stop)
 
 
 def _mime_for_path(path: Path) -> str:
@@ -142,15 +145,12 @@ def _mime_for_path(path: Path) -> str:
     return "image/jpeg"
 
 
-def image_dimensions(path: Path) -> tuple[int, int]:
+def image_dimensions(path: Path, stop=None) -> tuple[int, int]:
     """Return the pixel dimensions of an image via ImageMagick."""
     try:
-        out = subprocess.run(
-            ["magick", "identify", "-format", "%w %h", str(path)],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
+        out = subproc.run(
+            ["magick", "identify", "-format", "%w %h", str(path)], stop=stop
+        ).stdout.decode(errors="replace")
     except (FileNotFoundError, subprocess.CalledProcessError):
         return (0, 0)
     parts = out.split()

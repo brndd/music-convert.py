@@ -51,6 +51,7 @@ class Config:
     watch: bool = False
     settle_seconds: float = DEFAULT_SETTLE_SECONDS
     rescan_seconds: float = DEFAULT_RESCAN_SECONDS
+    progress: str = "bar"
     state_dir: Path | None = None
     cache_dir: Path | None = None
 

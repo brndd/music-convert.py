@@ -7,11 +7,18 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .scope import ScanScope
+
 SCHEMA_VERSION = 1
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _like_escape(value: str) -> str:
+    """Escape ``%``, ``_`` and ``\\`` for a SQL ``LIKE`` with ``ESCAPE '\\'``."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 @dataclass
@@ -103,6 +110,14 @@ class State:
         rows = self._conn.execute("SELECT * FROM outputs").fetchall()
         return [_output_from_row(row) for row in rows]
 
+    def outputs_in_scope(self, scope: ScanScope) -> list[OutputRow]:
+        rows = self._rows_in_scope("outputs", "relpath", scope)
+        return [
+            _output_from_row(row)
+            for row in rows
+            if scope.path_in_scope(row["relpath"])
+        ]
+
     def upsert_output(self, row: OutputRow) -> None:
         with self._conn:
             self._conn.execute(
@@ -136,6 +151,14 @@ class State:
         rows = self._conn.execute("SELECT * FROM covers").fetchall()
         return [_cover_from_row(row) for row in rows]
 
+    def covers_in_scope(self, scope: ScanScope) -> list[CoverRow]:
+        rows = self._rows_in_scope("covers", "dir_relpath", scope)
+        return [
+            _cover_from_row(row)
+            for row in rows
+            if scope.dir_in_scope(row["dir_relpath"])
+        ]
+
     def upsert_cover(self, row: CoverRow) -> None:
         with self._conn:
             self._conn.execute(
@@ -155,6 +178,33 @@ class State:
     def delete_cover(self, dir_relpath: str) -> None:
         with self._conn:
             self._conn.execute("DELETE FROM covers WHERE dir_relpath = ?", (dir_relpath,))
+
+    # -- scope -----------------------------------------------------------
+
+    def _rows_in_scope(
+        self, table: str, column: str, scope: ScanScope
+    ) -> list[sqlite3.Row]:
+        """Fetch the *table* rows that could fall within *scope*.
+
+        The ``LIKE`` filter only narrows the candidate set; callers must still
+        check membership with the scope because it is case-insensitive and
+        coarse.
+        """
+        prefixes = scope.candidate_prefixes()
+        if prefixes is not None and not prefixes:
+            return []
+        if prefixes is None:
+            return self._conn.execute(f"SELECT * FROM {table}").fetchall()
+        clauses = []
+        params: list[str] = []
+        for prefix in prefixes:
+            clauses.append(f"({column} = ? OR {column} LIKE ? ESCAPE '\\')")
+            params.append(prefix)
+            params.append(_like_escape(prefix) + "/%")
+        where = " OR ".join(clauses)
+        return self._conn.execute(
+            f"SELECT * FROM {table} WHERE {where}", params
+        ).fetchall()
 
 
 def _output_from_row(row: sqlite3.Row) -> OutputRow:

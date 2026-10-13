@@ -390,6 +390,230 @@ def test_watch(root: Path) -> None:
             process.kill()
 
 
+def test_scope_units(root: Path) -> None:
+    print("test_scope_units")
+    sys.path.insert(0, str(REPO))
+    from musicconvert.scanning import scan_source
+    from musicconvert.scope import ScanScope
+    from musicconvert.state import State, new_cover, new_output
+
+    lib = root / "scope-library"
+    for rel in ("A/one.flac", "A/two.mp3", "B/three.opus", "root.flac"):
+        path = lib / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"stub")
+    (lib / "A" / "cover.jpg").write_bytes(b"img")
+
+    full = scan_source(lib)
+    check(
+        sorted(sf.relpath for sf in full.files)
+        == ["A/one.flac", "A/two.mp3", "B/three.opus", "root.flac"],
+        "full scan sees every file",
+    )
+
+    partial = scan_source(lib, ScanScope(dirs={"A"}))
+    check(
+        sorted(sf.relpath for sf in partial.files) == ["A/one.flac", "A/two.mp3"],
+        "directory scope scans only that directory",
+    )
+    check("A" in partial.external_art, "directory scope finds external art")
+
+    top = scan_source(lib, ScanScope(dirs={""}))
+    check(
+        [sf.relpath for sf in top.files] == ["root.flac"],
+        "root directory scope is non-recursive",
+    )
+
+    subtree = scan_source(lib, ScanScope(trees={"A"}))
+    check(
+        sorted(sf.relpath for sf in subtree.files) == ["A/one.flac", "A/two.mp3"],
+        "tree scope scans the subtree",
+    )
+
+    state = State(root / "scope-state" / "state.sqlite3")
+    for out in ("A/one.opus", "A/two.mp3", "B/three.opus"):
+        state.upsert_output(new_output(relpath=out, source=out, kind="opus", policy="p"))
+    state.upsert_cover(new_cover(dir_relpath="A", art_source="A/cover.jpg", art_kind="external", policy="p"))
+    state.upsert_cover(new_cover(dir_relpath="B", art_source="B/x.jpg", art_kind="external", policy="p"))
+
+    dir_scope = ScanScope(dirs={"A"})
+    check(
+        sorted(r.relpath for r in state.outputs_in_scope(dir_scope))
+        == ["A/one.opus", "A/two.mp3"],
+        "directory scope state query is exact",
+    )
+    check(
+        [c.dir_relpath for c in state.covers_in_scope(dir_scope)] == ["A"],
+        "directory scope cover query is exact",
+    )
+    tree_scope = ScanScope(trees={"A"})
+    check(
+        sorted(r.relpath for r in state.outputs_in_scope(tree_scope))
+        == ["A/one.opus", "A/two.mp3"],
+        "tree scope state query matches the subtree",
+    )
+    check(len(state.outputs_in_scope(ScanScope(full=True))) == 3, "full scope loads all outputs")
+    check(len(state.outputs_in_scope(ScanScope())) == 0, "empty scope loads nothing")
+    state.close()
+
+
+def test_watch_rename(root: Path) -> None:
+    print("test_watch_rename")
+    source = root / "rename-library"
+    output = root / "rename-output"
+    state = root / "rename-state"
+    cache = root / "rename-cache"
+
+    album = source / "Band" / "Record"
+    for name in ("01 - a.flac", "02 - b.mp3"):
+        make_audio(album / name)
+        set_tags(album / name, album="Record", albumartist="Band", title=name)
+    make_cover(root / "rename-cover.jpg", 600, "purple")
+    shutil.copyfile(root / "rename-cover.jpg", album / "cover.jpg")
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(CONVERTER),
+            "--watch",
+            "-q",
+            "--settle-seconds",
+            "0.5",
+            "--rescan-interval",
+            "3600",
+            "--state-dir",
+            str(state),
+            "--cache-dir",
+            str(cache),
+            str(source),
+            str(output),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        converted = output / "Band" / "Record" / "01 - a.opus"
+        if not wait_for(lambda: converted.is_file(), timeout=15):
+            check(False, "rename setup: initial conversion")
+            return
+        check((output / "Band" / "Record" / "cover.jpg").is_file(), "rename setup: cover generated")
+
+        new_album = source / "Band" / "Record Two"
+        album.rename(new_album)
+        moved = output / "Band" / "Record Two" / "01 - a.opus"
+        if not wait_for(lambda: moved.is_file(), timeout=15):
+            check(False, "watch mode follows a renamed directory")
+            return
+        check(True, "watch mode follows a renamed directory")
+        check(not (output / "Band" / "Record" / "01 - a.opus").exists(), "old output removed after rename")
+        check((output / "Band" / "Record Two" / "cover.jpg").is_file(), "cover follows the renamed directory")
+
+        shutil.rmtree(new_album)
+        if not wait_for(lambda: not moved.exists(), timeout=15):
+            check(False, "watch mode removes outputs after directory deletion")
+            return
+        check(True, "watch mode removes outputs after directory deletion")
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
+def test_progress(root: Path) -> None:
+    print("test_progress")
+    source = root / "progress-library"
+    album = source / "Q" / "R"
+    for name in ("01.flac", "02.flac", "03.mp3"):
+        make_audio(album / name)
+
+    def convert(tag: str, *extra: str) -> subprocess.CompletedProcess:
+        return run(
+            *extra,
+            "-y",
+            "--state-dir",
+            str(root / f"progress-state-{tag}"),
+            "--cache-dir",
+            str(root / f"progress-cache-{tag}"),
+            str(source),
+            str(root / f"progress-output-{tag}"),
+        )
+
+    result = convert("lines", "--progress", "lines")
+    check(result.returncode == 0, "lines progress run succeeds")
+    check(
+        "build " in result.stderr and "/3]" in result.stderr,
+        "lines mode prints one line per processed item",
+    )
+
+    result = convert("bar")
+    check(
+        "build " in result.stderr and "/3]" in result.stderr,
+        "default bar mode falls back to per-item lines when not a terminal",
+    )
+
+    result = convert("none", "--progress", "none")
+    check("build " not in result.stderr, "none mode shows no per-item lines")
+    check("built=3" in result.stderr, "summary is still logged without a progress display")
+
+    result = convert("quiet", "-q")
+    check(result.stderr.strip() == "", "quiet mode suppresses progress and info logs")
+
+
+def test_scan_progress(root: Path) -> None:
+    print("test_scan_progress")
+    sys.path.insert(0, str(REPO))
+    from musicconvert.scanning import scan_source
+
+    lib = root / "scan-progress"
+    for i in range(3):
+        album = lib / f"album{i}"
+        album.mkdir(parents=True)
+        (album / "track.flac").write_bytes(b"stub")
+
+    class Fake:
+        def __init__(self) -> None:
+            self.starts: list[int] = []
+            self.advances = 0
+
+        def scan_start(self, total: int) -> None:
+            self.starts.append(total)
+
+        def scan_advance(self, label: str = "") -> None:
+            self.advances += 1
+
+    expected = sum(1 for _ in os.walk(lib))
+    progress = Fake()
+    scan_source(lib, progress=progress)
+    check(progress.starts == [expected], "scan reports a known directory total up front")
+    check(progress.advances == expected, "scan advances once per directory")
+
+
+def test_cancellation(root: Path) -> None:
+    print("test_cancellation")
+    sys.path.insert(0, str(REPO))
+    import threading
+    from musicconvert import subproc
+
+    stop = threading.Event()
+    timer = threading.Timer(0.3, stop.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        subproc.run(
+            [sys.executable, "-c", "import time; time.sleep(30)"], stop=stop
+        )
+        check(False, "stop request cancels a running subprocess")
+    except subproc.Cancelled:
+        check(True, "stop request cancels a running subprocess")
+    finally:
+        timer.cancel()
+    check(time.monotonic() - started < 5, "cancellation returns promptly")
+    check(subproc.active() == 0, "no child processes are left registered")
+
+
 def wait_for(predicate, timeout: float, interval: float = 0.25) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -408,8 +632,13 @@ def main() -> int:
         test_deletion(root, source, output, state, cache)
         test_dry_run(root, source, output, state, cache)
         test_unrelated_preserved(source, output, state, cache)
+        test_scope_units(root)
+        test_scan_progress(root)
+        test_cancellation(root)
+        test_progress(root)
         test_collision(root)
         test_watch(root)
+        test_watch_rename(root)
 
     print()
     if failures:

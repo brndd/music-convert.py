@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from . import formats
+from . import formats, subproc
 from .config import OPUS_BITRATE, OPUS_DOWNMIX
 from .formats import Picture
 
@@ -15,7 +15,12 @@ class BuildError(RuntimeError):
     pass
 
 
-def encode_flac(src: Path, dest_tmp: Path, picture_path: Path | None) -> None:
+def encode_flac(
+    src: Path,
+    dest_tmp: Path,
+    picture_path: Path | None,
+    stop=None,
+) -> None:
     """Encode a FLAC file to Opus at *dest_tmp*."""
     cmd = ["opusenc", "--quiet", "--discard-pictures", "--bitrate", OPUS_BITRATE]
     if OPUS_DOWNMIX:
@@ -24,11 +29,11 @@ def encode_flac(src: Path, dest_tmp: Path, picture_path: Path | None) -> None:
         cmd += ["--picture", str(picture_path)]
     cmd += [str(src), str(dest_tmp)]
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
+        subproc.run(cmd, stop=stop)
     except FileNotFoundError as exc:
         raise BuildError("opusenc is not installed") from exc
     except subprocess.CalledProcessError as exc:
-        detail = exc.stderr.decode(errors="replace").strip()
+        detail = (exc.stderr or b"").decode(errors="replace").strip()
         raise BuildError(f"opusenc failed on {src}: {detail}") from exc
 
 

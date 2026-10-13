@@ -3,11 +3,17 @@
 Inotify only signals *that* something may have changed. This module decides
 what actually needs doing by scanning the source tree, comparing fingerprints
 against persistent state, and rebuilding the affected outputs.
+
+A daemon pass is limited by a :class:`~musicconvert.scope.ScanScope`: only the
+directories named by the change set are re-read, and only outputs and covers
+inside them are candidates for building or deletion. One-shot runs use a full
+scope.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,8 +22,11 @@ from . import artwork, process
 from .artwork import ExternalArt
 from .config import Config
 from .formats import Picture, choose_embedded, extract_pictures
+from .progress import ProgressReporter
 from .scanning import ScanResult, SourceFile, scan_source
+from .scope import ScanScope
 from .state import CoverRow, OutputRow, State, new_cover, new_output
+from .subproc import Cancelled
 from .util import (
     atomic_replace,
     kind_of,
@@ -66,6 +75,7 @@ class Summary:
     collisions: int = 0
     incomplete: bool = False
     dirty_again: bool = False
+    dirty_dirs: set[str] = field(default_factory=set)
 
     def log(self, logger: logging.Logger) -> None:
         if self.incomplete:
@@ -84,14 +94,27 @@ class Summary:
 
 
 class Reconciler:
-    def __init__(self, cfg: Config, state: State, logger: logging.Logger):
+    def __init__(
+        self,
+        cfg: Config,
+        state: State,
+        logger: logging.Logger,
+        reporter: ProgressReporter | None = None,
+        stop: threading.Event | None = None,
+    ):
         self.cfg = cfg
         self.state = state
         self.log = logger
+        self.progress = reporter if reporter is not None else ProgressReporter(cfg.progress)
+        self.stop = stop if stop is not None else threading.Event()
+
+    def _check_stop(self) -> None:
+        if self.stop.is_set():
+            raise Cancelled()
 
     # -- planning --------------------------------------------------------
 
-    def plan(self, scan: ScanResult) -> Plan:
+    def plan(self, scan: ScanResult, scope: ScanScope) -> Plan:
         plan = Plan(scan=scan)
         plan.collisions = dict(scan.collisions)
 
@@ -105,15 +128,21 @@ class Reconciler:
             if len(sources) == 1
         }
 
+        # Only rows the current scope can touch are loaded; everything else is
+        # left exactly as it is.
+        existing = {row.relpath: row for row in self.state.outputs_in_scope(scope)}
+
         for out, sf in sorted(valid.items()):
+            self._check_stop()
             external = scan.external_art.get(sf.dir_rel)
-            row = self.state.get_output(out)
+            row = existing.get(out)
             if row is not None and self._output_matches(row, sf, external):
                 continue
             plan.builds.append(BuildItem(sf, out, external))
 
         current = set(valid)
-        for row in self.state.all_outputs():
+        for row in existing.values():
+            self._check_stop()
             if row.relpath in current:
                 continue
             # Do not delete an output whose target path is now ambiguous; a
@@ -122,7 +151,7 @@ class Reconciler:
                 continue
             plan.deletes.append(row)
 
-        self._plan_covers(scan, plan)
+        self._plan_covers(scan, plan, scope)
         return plan
 
     def _output_matches(
@@ -141,11 +170,12 @@ class Reconciler:
             art_mtime,
         )
 
-    def _plan_covers(self, scan: ScanResult, plan: Plan) -> None:
-        existing = {c.dir_relpath: c for c in self.state.all_covers()}
+    def _plan_covers(self, scan: ScanResult, plan: Plan, scope: ScanScope) -> None:
+        existing = {c.dir_relpath: c for c in self.state.covers_in_scope(scope)}
         source_dirs = scan.source_dirs
 
         for d in sorted(source_dirs):
+            self._check_stop()
             prev = existing.get(d)
             desired = self._desired_cover(d, scan, prev)
             if desired is None:
@@ -184,6 +214,7 @@ class Reconciler:
                 return ("embedded", sf.relpath, sf.size, sf.mtime)
 
         for sf in sorted(scan.files_in_dir(dir_rel), key=lambda s: s.relpath):
+            self._check_stop()
             try:
                 picture = choose_embedded(extract_pictures(sf.path))
             except Exception:
@@ -194,8 +225,22 @@ class Reconciler:
 
     # -- execution -------------------------------------------------------
 
-    def reconcile(self) -> Summary:
-        scan = scan_source(self.cfg.source)
+    def reconcile(self, scope: ScanScope | None = None) -> Summary:
+        scope = scope if scope is not None else ScanScope(full=True)
+        if not scope.full:
+            self.log.info(
+                "incremental reconcile over %d changed location(s)",
+                len(scope.dirs) + len(scope.trees),
+            )
+        try:
+            return self._reconcile(scope)
+        finally:
+            self.progress.finish()
+
+    def _reconcile(self, scope: ScanScope) -> Summary:
+        scan = scan_source(
+            self.cfg.source, scope, progress=self.progress, stop=self.stop
+        )
         summary = Summary(scanned=len(scan.files), incomplete=not scan.complete)
 
         if scan.collisions:
@@ -208,11 +253,13 @@ class Reconciler:
         if not scan.complete:
             for error in scan.errors[:10]:
                 self.log.error("scan error: %s", error)
+            self.progress.finish()
             summary.log(self.log)
             return summary
 
-        plan = self.plan(scan)
+        plan = self.plan(scan, scope)
         if self.cfg.dry_run:
+            self.progress.finish()
             self._describe(plan)
             summary.log(self.log)
             return summary
@@ -236,9 +283,19 @@ class Reconciler:
 
     def _execute(self, plan: Plan, summary: Summary) -> None:
         computed_images: dict[str, Path | None] = {}
-        self._execute_covers(plan, summary, computed_images)
-        self._execute_builds(plan, summary, computed_images)
-        self._execute_deletes(plan, summary)
+        total = (
+            len(plan.cover_builds)
+            + len(plan.cover_deletes)
+            + len(plan.builds)
+            + len(plan.deletes)
+        )
+        self.progress.start(total)
+        try:
+            self._execute_covers(plan, summary, computed_images)
+            self._execute_builds(plan, summary, computed_images)
+            self._execute_deletes(plan, summary)
+        finally:
+            self.progress.finish()
 
     # -- covers ----------------------------------------------------------
 
@@ -249,31 +306,45 @@ class Reconciler:
         computed_images: dict[str, Path | None],
     ) -> None:
         if plan.cover_builds:
-            with ThreadPoolExecutor(max_workers=self.cfg.jobs) as pool:
-                futures = {
-                    pool.submit(self._prepare_cover, cb): cb for cb in plan.cover_builds
-                }
+            self._check_stop()
+            pool = ThreadPoolExecutor(max_workers=self.cfg.jobs)
+            futures = {
+                pool.submit(self._prepare_cover, cb): cb for cb in plan.cover_builds
+            }
+            try:
                 for future in as_completed(futures):
+                    if self.stop.is_set():
+                        raise Cancelled()
                     cb = futures[future]
                     image, error = future.result()
                     if error is not None:
                         self.log.error("cover for %s failed: %s", cb.dir_rel or ".", error)
                         summary.failed += 1
+                        self.progress.advance(f"cover {cb.dir_rel or '.'}/{COVER_NAME} (failed)")
                         continue
                     computed_images[cb.dir_rel] = image
                     self._publish_cover(cb, image)
                     summary.covers_built += 1
+                    self.progress.advance(f"cover {cb.dir_rel or '.'}/{COVER_NAME}")
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
 
         for d in plan.cover_deletes:
+            self._check_stop()
             remove_quietly(self.cfg.output / d / COVER_NAME if d else self.cfg.output / COVER_NAME)
             self.state.delete_cover(d)
             computed_images[d] = None
             summary.covers_deleted += 1
+            self.progress.advance(f"cover- {d or '.'}/{COVER_NAME}")
 
     def _prepare_cover(self, cb: CoverBuild) -> tuple[Path | None, str | None]:
+        if self.stop.is_set():
+            raise Cancelled()
         try:
             image = self._cover_image_for(cb.dir_rel, cb.art_kind, cb.art_source)
             return image, None
+        except Cancelled:
+            raise
         except Exception as exc:  # noqa: BLE001 - report and continue
             return None, str(exc)
 
@@ -282,7 +353,9 @@ class Reconciler:
     ) -> Path | None:
         if art_kind == "external":
             art = self.cfg.source / art_source
-            return artwork.resize_file(art, self.cfg.resolved_cache_dir, self.cfg.policy)
+            return artwork.resize_file(
+                art, self.cfg.resolved_cache_dir, self.cfg.policy, stop=self.stop
+            )
         sf = self._source_by_rel(art_source)
         if sf is None:
             return None
@@ -290,7 +363,11 @@ class Reconciler:
         if picture is None:
             return None
         return artwork.resize_bytes(
-            picture.data, picture.mime, self.cfg.resolved_cache_dir, self.cfg.policy
+            picture.data,
+            picture.mime,
+            self.cfg.resolved_cache_dir,
+            self.cfg.policy,
+            stop=self.stop,
         )
 
     def _publish_cover(self, cb: CoverBuild, image: Path | None) -> None:
@@ -321,40 +398,56 @@ class Reconciler:
 
         build_dirs = {item.source.dir_rel for item in plan.builds}
         for d in build_dirs:
+            self._check_stop()
             if d in computed_images:
                 continue
             computed_images[d] = self._fallback_cover_image(plan.scan, d)
 
-        with ThreadPoolExecutor(max_workers=self.cfg.jobs) as pool:
-            futures = {
-                pool.submit(self._run_build, item, computed_images.get(item.source.dir_rel)): item
-                for item in plan.builds
-            }
+        self._check_stop()
+        pool = ThreadPoolExecutor(max_workers=self.cfg.jobs)
+        futures = {
+            pool.submit(self._run_build, item, computed_images.get(item.source.dir_rel)): item
+            for item in plan.builds
+        }
+        try:
             for future in as_completed(futures):
+                if self.stop.is_set():
+                    raise Cancelled()
                 item = futures[future]
                 tmp, error = future.result()
                 if error is not None:
                     self.log.error("build %s failed: %s", item.output_relpath, error)
                     summary.failed += 1
+                    self.progress.advance(f"build {item.output_relpath} (failed)")
                     continue
                 if self._source_changed(item) or self._art_changed(item):
                     self.log.info("source changed during build; rescheduling %s", item.output_relpath)
                     if tmp is not None:
                         remove_quietly(tmp)
                     summary.dirty_again = True
+                    summary.dirty_dirs.add(item.source.dir_rel)
+                    self.progress.advance(f"build {item.output_relpath} (rescheduled)")
                     continue
                 dest = self.cfg.output / item.output_relpath
                 atomic_replace(tmp, dest)
                 self._record_output(item, dest)
                 summary.built += 1
+                self.progress.advance(f"build {item.output_relpath}")
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
     def _fallback_cover_image(self, scan: ScanResult, dir_rel: str) -> Path | None:
         external = scan.external_art.get(dir_rel)
         if external is not None:
             try:
                 return artwork.resize_file(
-                    external.path, self.cfg.resolved_cache_dir, self.cfg.policy
+                    external.path,
+                    self.cfg.resolved_cache_dir,
+                    self.cfg.policy,
+                    stop=self.stop,
                 )
+            except Cancelled:
+                raise
             except Exception as exc:  # noqa: BLE001
                 self.log.error("cover resize for %s failed: %s", dir_rel or ".", exc)
                 return None
@@ -363,19 +456,23 @@ class Reconciler:
             return None
         try:
             return self._cover_image_for(dir_rel, prev.art_kind, prev.art_source)
+        except Cancelled:
+            raise
         except Exception:  # noqa: BLE001
             return None
 
     def _run_build(
         self, item: BuildItem, cover_image: Path | None
     ) -> tuple[Path | None, str | None]:
+        if self.stop.is_set():
+            raise Cancelled()
         dest = self.cfg.output / item.output_relpath
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = temp_path(dest, "build")
         try:
             image_path, dims = self._select_artwork(item, cover_image)
             if item.source.kind == "flac":
-                process.encode_flac(item.source.path, tmp, image_path)
+                process.encode_flac(item.source.path, tmp, image_path, stop=self.stop)
             else:
                 picture = None
                 if image_path is not None:
@@ -387,6 +484,9 @@ class Reconciler:
                 )
             process.verify(tmp)
             return tmp, None
+        except Cancelled:
+            remove_quietly(tmp)
+            raise
         except Exception as exc:  # noqa: BLE001 - report and continue
             remove_quietly(tmp)
             return None, str(exc)
@@ -398,11 +498,15 @@ class Reconciler:
         chosen = choose_embedded(pictures)
         if chosen is not None:
             path = artwork.resize_bytes(
-                chosen.data, chosen.mime, self.cfg.resolved_cache_dir, self.cfg.policy
+                chosen.data,
+                chosen.mime,
+                self.cfg.resolved_cache_dir,
+                self.cfg.policy,
+                stop=self.stop,
             )
-            return path, artwork.image_dimensions(path)
+            return path, artwork.image_dimensions(path, stop=self.stop)
         if cover_image is not None:
-            return cover_image, artwork.image_dimensions(cover_image)
+            return cover_image, artwork.image_dimensions(cover_image, stop=self.stop)
         return None, (0, 0)
 
     def _record_output(self, item: BuildItem, dest: Path) -> None:
@@ -447,10 +551,12 @@ class Reconciler:
 
     def _execute_deletes(self, plan: Plan, summary: Summary) -> None:
         for row in plan.deletes:
+            self._check_stop()
             dest = self.cfg.output / row.relpath
             remove_quietly(dest)
             self.state.delete_output(row.relpath)
             summary.deleted += 1
+            self.progress.advance(f"delete {row.relpath}")
 
     # -- helpers ---------------------------------------------------------
 
